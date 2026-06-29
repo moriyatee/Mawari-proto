@@ -87,6 +87,80 @@ function planJourney(params) {
   return apiGet("/api/v1/plan", params);
 }
 
+// 純粋な徒歩経路を引くために避ける交通モード
+const WALK_ONLY_AVOID = "rail,subway,bus,tram,ferry,monorail,funicular";
+
+// 「乗車 → 徒歩」の合成経路を1件つくる。
+//   from → alight(駅) を通常検索(運賃が取れる区間まで乗車)し、
+//   alight → to を徒歩のみで検索して末尾につなぐ。
+async function composeRideThenWalk(from, to, alight, droppedTrains) {
+  const [rideRes, walkRes] = await Promise.allSettled([
+    planJourney({ from, to: alight.id, numItineraries: 1 }),
+    planJourney({ from: alight.id, to, avoidModes: WALK_ONLY_AVOID, numItineraries: 1 }),
+  ]);
+  if (rideRes.status !== "fulfilled" || walkRes.status !== "fulfilled") return null;
+
+  const ride = (rideRes.value.journeys || [])[0];
+  const walk = (walkRes.value.journeys || [])[0];
+  if (!ride || !walk) return null;
+
+  const walkLegs = walk.legs || [];
+  // 徒歩のみで到達できない(=途中で鉄道が混ざる)場合は対象外
+  if (!walkLegs.length || walkLegs.some((l) => l.kind !== "walk")) return null;
+
+  // 徒歩区間の時刻を、乗車の到着時刻に接続するようオフセット
+  const offset = ride.arrivalSecs - walkLegs[0].departureSecs;
+  const shiftedWalk = walkLegs.map((l) => ({
+    ...l,
+    departureSecs: l.departureSecs + offset,
+    arrivalSecs: l.arrivalSecs + offset,
+  }));
+  const arrivalSecs = ride.arrivalSecs + walk.durationSecs;
+
+  return {
+    departureSecs: ride.departureSecs,
+    arrivalSecs,
+    durationSecs: arrivalSecs - ride.departureSecs,
+    transferCount: ride.transferCount || 0,
+    legs: [...(ride.legs || []), ...shiftedWalk],
+    fare: ride.fare || null,
+    __mawariWalkLast: {
+      alightName: alight.name,
+      droppedTrains,
+      walkSecs: walk.durationSecs,
+    },
+  };
+}
+
+// 基準経路の末尾の鉄道区間を徒歩に置き換えた候補を生成する。
+// → 運賃データのある区間まで乗車し、残りを歩くことで
+//   「運賃が表示される」かつ「歩いて節約」を両立できる。
+async function buildWalkLastLegCandidates(from, to, base) {
+  const transitLegs = (base.legs || []).filter((l) => l.kind === "transit");
+  // 置き換えても1区間以上の乗車が残らない場合は対象外
+  if (transitLegs.length < 2) return [];
+
+  const out = [];
+  const seenAlight = new Set();
+  const maxDrop = Math.min(2, transitLegs.length - 1); // 末尾1〜2区間を徒歩化
+  for (let drop = 1; drop <= maxDrop; drop++) {
+    const alight = transitLegs[transitLegs.length - 1 - drop].to;
+    if (!alight || !alight.id || seenAlight.has(alight.id)) continue;
+    seenAlight.add(alight.id);
+    const droppedTrains = transitLegs
+      .slice(transitLegs.length - drop)
+      .map((l) => l.routeName)
+      .filter(Boolean);
+    try {
+      const composite = await composeRideThenWalk(from, to, alight, droppedTrains);
+      if (composite) out.push(composite);
+    } catch {
+      /* この候補だけスキップ */
+    }
+  }
+  return out;
+}
+
 // ---- 計算ロジック -----------------------------------------------------
 
 function fareValue(journey) {
@@ -119,6 +193,13 @@ function walkStats(journey) {
 
 function transitLegCount(journey) {
   return (journey.legs || []).filter((l) => l.kind === "transit").length;
+}
+
+// 並び替え用の運賃キー。値が小さいほど上位。
+function fareSortKey(c, F0) {
+  if (c.deltaFare != null) return c.deltaFare; // 基準と比較できる → 差額順
+  if (c.fare != null && F0 == null) return -1e6 + c.fare; // 基準不明だが運賃判明 → 最優先
+  return Infinity; // 運賃不明
 }
 
 // 経路の同一判定用シグネチャ (発車時刻は含めず「経路の形」で判定)
@@ -166,6 +247,13 @@ async function findDetours(from, to, budgetMin) {
   if (altRes.status === "fulfilled") pool.push(...(altRes.value.journeys || []));
   if (busRes.status === "fulfilled") pool.push(...(busRes.value.journeys || []));
 
+  // 4. 末尾の鉄道区間を徒歩に置き換えた候補(例: 押上で降りて曳舟まで歩く)
+  try {
+    pool.push(...(await buildWalkLastLegCandidates(from, to, base)));
+  } catch {
+    /* 徒歩置換候補が作れなくても他候補は出す */
+  }
+
   // 重複排除 (同じ経路の形は最速のものだけ残す)
   const bySig = new Map();
   for (const j of pool) {
@@ -202,9 +290,11 @@ async function findDetours(from, to, budgetMin) {
     .filter((c) => c.sig !== baseSig)
     .filter((c) => c.deltaSecs >= 0 && c.deltaSecs <= budgetSecs)
     .sort((a, b) => {
-      // 運賃が安い順 → 同点なら追加時間が短い順
-      const fa = a.deltaFare == null ? Infinity : a.deltaFare;
-      const fb = b.deltaFare == null ? Infinity : b.deltaFare;
+      // 運賃が安い順 → 同点なら追加時間が短い順。
+      // 基準の運賃が不明なときは、運賃が判明している候補(=徒歩置換で
+      // 運賃の取れる区間まで乗車した候補など)を先頭に出す。
+      const fa = fareSortKey(a, F0);
+      const fb = fareSortKey(b, F0);
       if (fa !== fb) return fa - fb;
       return a.deltaSecs - b.deltaSecs;
     });
@@ -313,9 +403,18 @@ function renderCandidates(detours) {
 
     const badges = el("div", "badges");
     const dtMin = Math.round(c.deltaSecs / 60);
+    const wl = c.journey.__mawariWalkLast;
     badges.appendChild(badge(dtMin === 0 ? "time zero" : "time", `+${dtMin}分`));
-    badges.appendChild(fareBadge(c.fare, c.deltaFare));
+    if (wl && c.deltaFare == null && c.fare != null) {
+      // 基準の運賃が不明でも、乗車区間の運賃は表示できる
+      badges.appendChild(badge("save", `運賃 ${c.fare}円（鉄道区間のみ／歩く区間は不要）`));
+    } else {
+      badges.appendChild(fareBadge(c.fare, c.deltaFare));
+    }
     badges.appendChild(walkBadge(c.walk));
+    if (wl) {
+      badges.appendChild(badge("walklast", `🚶 ${wl.alightName}で降りて徒歩`));
+    }
     card.appendChild(badges);
 
     card.appendChild(renderLegs(c.journey));
