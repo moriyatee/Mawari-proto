@@ -161,6 +161,181 @@ async function buildWalkLastLegCandidates(from, to, base) {
   return out;
 }
 
+// ---- ODPT 連携 (運賃補完 + 通過駅) ------------------------------------
+//   運賃データの無い区間(東武等)の実額運賃と、各乗車区間の通過駅(駅順)を
+//   ODPT から取得する。キーは端末の localStorage にのみ保存する。
+
+const ODPT_BASE = "https://api.odpt.org/api/v4";
+const ODPT_KEY_LS = "mawari.odptKey";
+
+function getOdptKey() {
+  try {
+    return localStorage.getItem(ODPT_KEY_LS) || "";
+  } catch {
+    return "";
+  }
+}
+function setOdptKey(k) {
+  try {
+    if (k) localStorage.setItem(ODPT_KEY_LS, k);
+    else localStorage.removeItem(ODPT_KEY_LS);
+  } catch {
+    /* localStorage 不可環境では何もしない */
+  }
+}
+function hasOdptKey() {
+  return !!getOdptKey();
+}
+
+async function odptGet(type, params) {
+  const key = getOdptKey();
+  if (!key) throw new Error("ODPTキー未設定");
+  const url = new URL(`${ODPT_BASE}/${type}`);
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
+  }
+  url.searchParams.set("acl:consumerKey", key);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`ODPT ${res.status}`);
+  return res.json();
+}
+
+// ls8h の駅id → ODPT の駅id(odpt.Station:...) を推定。
+//   メトロ/都営: "odpt-...:odpt.Station:..." → そのまま後半を使う
+//   その他(東武等): "tokyo-tobu-rail:Tobu.TobuSkytree.Hikifune" → "odpt.Station:Tobu.TobuSkytree.Hikifune"
+function toOdptStationId(ls8hId) {
+  if (!ls8hId) return null;
+  const i = ls8hId.indexOf(":");
+  const local = i >= 0 ? ls8hId.slice(i + 1) : ls8hId;
+  if (local.startsWith("odpt.Station:")) return local;
+  if (/^[A-Za-z0-9]+\.[A-Za-z0-9]+\.[A-Za-z0-9]+/.test(local)) return "odpt.Station:" + local;
+  return null;
+}
+function odptOperatorOfStation(odptStationId) {
+  const body = odptStationId.replace(/^odpt\.Station:/, "");
+  return "odpt.Operator:" + body.split(".")[0];
+}
+function odptRailwayOfStation(odptStationId) {
+  const body = odptStationId.replace(/^odpt\.Station:/, "");
+  const parts = body.split(".");
+  if (parts.length < 3) return null;
+  return "odpt.Railway:" + parts.slice(0, 2).join(".");
+}
+function shortStationName(odptStationId) {
+  return odptStationId.split(".").pop();
+}
+
+// 路線の駅順(通過駅含む) を取得してキャッシュ。失敗時は null。
+const _railwayCache = new Map();
+async function fetchRailwayStations(odptStationId) {
+  const railway = odptRailwayOfStation(odptStationId);
+  if (!railway) return null;
+  if (_railwayCache.has(railway)) return _railwayCache.get(railway);
+  let result = null;
+  try {
+    const [rwArr, staArr] = await Promise.all([
+      odptGet("odpt:Railway", { "owl:sameAs": railway }),
+      odptGet("odpt:Station", { "odpt:railway": railway }),
+    ]);
+    const rw = (rwArr || [])[0];
+    const order = ((rw && rw["odpt:stationOrder"]) || [])
+      .map((o) => ({ id: o["odpt:station"], index: o["odpt:index"] }))
+      .sort((a, b) => a.index - b.index);
+    const infoMap = {};
+    for (const s of staArr || []) {
+      const t = s["dc:title"] || (s["odpt:stationTitle"] && s["odpt:stationTitle"].ja);
+      if (s["owl:sameAs"]) {
+        infoMap[s["owl:sameAs"]] = {
+          name: t || shortStationName(s["owl:sameAs"]),
+          lat: s["geo:lat"],
+          lon: s["geo:long"],
+        };
+      }
+    }
+    result = order.map((o) => {
+      const info = infoMap[o.id] || {};
+      return { id: o.id, name: info.name || shortStationName(o.id), lat: info.lat, lon: info.lon };
+    });
+    if (!result.length) result = null;
+  } catch {
+    result = null;
+  }
+  _railwayCache.set(railway, result);
+  return result;
+}
+
+// 1乗車レッグの [乗車駅 … 通過駅 … 降車駅] を順序付きで返す(ls8h leg)。
+async function legStationSequence(leg) {
+  const boardOdpt = toOdptStationId(leg.from && leg.from.id);
+  const alightOdpt = toOdptStationId(leg.to && leg.to.id);
+  if (!boardOdpt || !alightOdpt) return null;
+  const stations = await fetchRailwayStations(boardOdpt);
+  if (!stations) return null;
+  const bi = stations.findIndex((s) => s.id === boardOdpt);
+  const ai = stations.findIndex((s) => s.id === alightOdpt);
+  if (bi < 0 || ai < 0) return null;
+  const slice = bi <= ai ? stations.slice(bi, ai + 1) : stations.slice(ai, bi + 1).reverse();
+  return slice; // [{id(odpt), name}], 乗車→降車の順
+}
+
+// ODPT 実額運賃 (fromStation→toStation)。IC優先。
+async function odptFare(fromOdpt, toOdpt) {
+  try {
+    const arr = await odptGet("odpt:RailwayFare", {
+      "odpt:operator": odptOperatorOfStation(fromOdpt),
+      "odpt:fromStation": fromOdpt,
+      "odpt:toStation": toOdpt,
+    });
+    const f = (arr || [])[0];
+    if (!f) return null;
+    const ic = f["odpt:icCardFare"];
+    const ticket = f["odpt:ticketFare"];
+    return typeof ic === "number" ? ic : typeof ticket === "number" ? ticket : null;
+  } catch {
+    return null;
+  }
+}
+
+// 経路全体の運賃を可能な限り埋める。
+//   直接運賃があればそれを使う。無ければ ODPT で事業者連続区間ごとに合算。
+//   { amount, complete } を返す。complete=false は一部不明(下限値)。
+async function fareFilled(journey) {
+  const direct = fareValue(journey);
+  if (direct != null) return { amount: direct, complete: true };
+  if (!hasOdptKey()) return { amount: null, complete: false };
+
+  const transit = (journey.legs || []).filter((l) => l.kind === "transit");
+  if (!transit.length) return { amount: null, complete: false };
+
+  // 事業者が連続する区間でグループ化
+  const groups = [];
+  for (const leg of transit) {
+    const fromO = toOdptStationId(leg.from && leg.from.id);
+    const toO = toOdptStationId(leg.to && leg.to.id);
+    const op = fromO ? odptOperatorOfStation(fromO) : null;
+    const last = groups[groups.length - 1];
+    if (last && last.op === op && fromO && last.toO === toO) continue; // 同一は稀
+    if (last && last.op === op) {
+      last.toO = toO; // 同事業者の続きは降車だけ伸ばす
+    } else {
+      groups.push({ op, fromO, toO });
+    }
+  }
+
+  let sum = 0;
+  let complete = true;
+  for (const g of groups) {
+    if (!g.fromO || !g.toO) {
+      complete = false;
+      continue;
+    }
+    const fare = await odptFare(g.fromO, g.toO);
+    if (fare == null) complete = false;
+    else sum += fare;
+  }
+  return { amount: complete || sum > 0 ? sum : null, complete };
+}
+
 // ---- 計算ロジック -----------------------------------------------------
 
 function fareValue(journey) {
@@ -312,6 +487,12 @@ function el(tag, cls, text) {
   return e;
 }
 
+function normHexColor(c) {
+  if (!c) return null;
+  const h = String(c).replace(/^#/, "");
+  return /^[0-9a-fA-F]{6}$/.test(h) ? "#" + h : null;
+}
+
 function renderLegs(journey) {
   const ul = el("ul", "legs");
   // アクセス徒歩
@@ -322,7 +503,7 @@ function renderLegs(journey) {
     if (leg.kind === "transit") {
       const line = leg.routeName || "(路線)";
       const detail = `${leg.from?.name ?? ""} ${hhmm(leg.departureSecs)} → ${leg.to?.name ?? ""} ${hhmm(leg.arrivalSecs)}`;
-      ul.appendChild(legRow("transit", line, detail));
+      ul.appendChild(legRow("transit", line, detail, normHexColor(leg.color)));
     } else {
       const mins = Math.round((leg.arrivalSecs - leg.departureSecs) / 60);
       const detail = `${leg.from?.name ?? ""} → ${leg.to?.name ?? ""}`;
@@ -335,11 +516,18 @@ function renderLegs(journey) {
   return ul;
 }
 
-function legRow(kind, line, detail) {
+function legRow(kind, line, detail, color) {
   const li = el("li", `leg-${kind}`);
-  li.appendChild(el("span", "dot"));
+  const dot = el("span", "dot");
+  if (kind === "transit" && color) {
+    li.style.borderLeftColor = color;
+    dot.style.background = color;
+  }
+  li.appendChild(dot);
   const wrap = el("div");
-  wrap.appendChild(el("span", "leg-line", line));
+  const lineEl = el("span", "leg-line", line);
+  if (kind === "transit" && color) lineEl.style.color = color;
+  wrap.appendChild(lineEl);
   if (detail) {
     wrap.appendChild(document.createTextNode(" "));
     wrap.appendChild(el("span", "leg-detail", detail));
@@ -368,7 +556,12 @@ function walkBadge(walk) {
   return badge("walk", `徒歩 約${walk.minutes}分 / 約${walk.meters}m / 約${walk.steps}歩 / 約${walk.kcal}kcal`);
 }
 
-function renderBaseline(baseCand) {
+function fareText(info) {
+  if (!info || info.amount == null) return null;
+  return info.complete ? `運賃 ${info.amount}円` : `運賃 概算 ${info.amount}円〜`;
+}
+
+async function renderBaseline(baseCand, ctx) {
   const box = document.getElementById("baseline");
   box.innerHTML = "";
   box.appendChild(el("div", "baseline-label", "最短経路（基準）"));
@@ -378,11 +571,178 @@ function renderBaseline(baseCand) {
     el("span", "card-sub", `${hhmm(baseCand.journey.departureSecs)} → ${hhmm(baseCand.journey.arrivalSecs)} ・ 乗換${baseCand.transfers}回`)
   );
   box.appendChild(head);
+
   const badges = el("div", "badges");
-  badges.appendChild(baseCand.fare != null ? badge("unknown", `運賃 ${baseCand.fare}円`) : badge("unknown", "運賃データなし"));
+  const fareInfo = await fareFilled(baseCand.journey);
+  ctx.baseFareInfo = fareInfo;
+  const ft = fareText(fareInfo);
+  badges.appendChild(
+    ft ? badge(fareInfo.complete ? "unknown" : "save", ft) : badge("unknown", "運賃データなし")
+  );
   badges.appendChild(walkBadge(baseCand.walk));
   box.appendChild(badges);
   box.appendChild(renderLegs(baseCand.journey));
+
+  // 通過駅スライダー(途中下車して歩く)をマウント
+  const slot = el("div", "alight-slot");
+  box.appendChild(slot);
+  mountInteractiveAlight(slot, ctx).catch(() => {});
+}
+
+// ---- インタラクティブ「降りて歩く」 ----------------------------------
+// 経路が通過する駅を一列に並べ、スライダーで降車駅を選ぶと、
+// そこから目的地までを徒歩で補完して再検索し、運賃・割引を更新する。
+
+async function buildPassedStations(base) {
+  const transit = (base.legs || []).filter((l) => l.kind === "transit");
+  const passed = [];
+  for (const leg of transit) {
+    const seq = await legStationSequence(leg);
+    if (!seq) return null; // 1区間でも駅順が取れなければ不可
+    for (const s of seq) {
+      const prev = passed[passed.length - 1];
+      // 乗換駅の重複を除去 (id一致 or 同名の連続)
+      if (prev && (prev.id === s.id || prev.name === s.name)) continue;
+      passed.push(s);
+    }
+  }
+  return passed.length >= 2 ? passed : null;
+}
+
+async function mountInteractiveAlight(slot, ctx) {
+  slot.innerHTML = "";
+  if (!hasOdptKey()) {
+    slot.appendChild(
+      el("p", "alight-hint", "🔧 「運賃・通過駅の設定」で ODPT キーを入れると、通過駅で降りて歩く調整ができます。")
+    );
+    return;
+  }
+  slot.appendChild(el("p", "alight-loading", "通過駅を取得中…"));
+  let passed;
+  try {
+    passed = await buildPassedStations(ctx.base);
+  } catch {
+    passed = null;
+  }
+  slot.innerHTML = "";
+  if (!passed) {
+    slot.appendChild(
+      el("p", "alight-hint", "この経路の通過駅は ODPT から取得できませんでした（JR・一部私鉄など未対応の場合があります）。")
+    );
+    return;
+  }
+  ctx.passed = passed;
+
+  const panel = el("div", "alight-panel");
+  panel.appendChild(el("div", "alight-title", "🚶 どこで降りて歩く？"));
+
+  // 駅の並び(乗車→…→降車)。最終駅=元の降車。途中を選ぶと残りを徒歩化。
+  const labels = el("div", "alight-stations");
+  passed.forEach((s, i) => {
+    const chip = el("span", "alight-chip", s.name);
+    chip.dataset.idx = String(i);
+    labels.appendChild(chip);
+  });
+  panel.appendChild(labels);
+
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = "1";
+  slider.max = String(passed.length - 1);
+  slider.value = String(passed.length - 1);
+  slider.className = "alight-range";
+  panel.appendChild(slider);
+
+  const out = el("div", "alight-result");
+  panel.appendChild(out);
+  slot.appendChild(panel);
+
+  const highlight = (idx) => {
+    for (const chip of labels.children) {
+      const i = Number(chip.dataset.idx);
+      chip.classList.toggle("active", i === idx);
+      chip.classList.toggle("ride", i <= idx);
+      chip.classList.toggle("walk", i > idx);
+    }
+  };
+
+  let timer = null;
+  let token = 0;
+  const onChange = () => {
+    const idx = Number(slider.value);
+    highlight(idx);
+    clearTimeout(timer);
+    if (idx >= passed.length - 1) {
+      out.innerHTML = "";
+      out.appendChild(el("p", "alight-note", "最後まで乗車（基準どおり）。スライダーを左に動かすと手前で降りて歩きます。"));
+      return;
+    }
+    out.innerHTML = "";
+    out.appendChild(el("p", "alight-loading", "再検索中…"));
+    const my = ++token;
+    timer = setTimeout(() => recomputeAlight(ctx, idx, out, my, () => token), 250);
+  };
+  slider.addEventListener("input", onChange);
+  highlight(passed.length - 1);
+}
+
+async function recomputeAlight(ctx, idx, out, my, currentToken) {
+  const station = ctx.passed[idx];
+  if (station.lat == null || station.lon == null) {
+    out.innerHTML = "";
+    out.appendChild(el("p", "alight-hint", `${station.name} の座標が取得できず、再検索できませんでした。`));
+    return;
+  }
+  const geo = `geo:${station.lat},${station.lon}`;
+  try {
+    const [rideRes, walkRes] = await Promise.allSettled([
+      planJourney({ from: ctx.from, to: geo, numItineraries: 1 }),
+      planJourney({ from: geo, to: ctx.to, avoidModes: WALK_ONLY_AVOID, numItineraries: 1 }),
+    ]);
+    if (my !== currentToken()) return; // 古い結果は破棄
+    const ride = rideRes.status === "fulfilled" ? (rideRes.value.journeys || [])[0] : null;
+    const walk = walkRes.status === "fulfilled" ? (walkRes.value.journeys || [])[0] : null;
+    if (!ride || !walk || (walk.legs || []).some((l) => l.kind !== "walk")) {
+      out.innerHTML = "";
+      out.appendChild(el("p", "alight-hint", `${station.name} から目的地まで徒歩経路が見つかりませんでした。`));
+      return;
+    }
+
+    const totalSecs = ride.durationSecs + walk.durationSecs;
+    const addSecs = totalSecs - ctx.base.durationSecs;
+    const walkMin = Math.round(walk.durationSecs / 60);
+    const walkMeters = Math.round((walk.durationSecs / 60) * WALK_SPEED_M_PER_MIN);
+
+    const rideFare = await fareFilled(ride);
+    if (my !== currentToken()) return;
+
+    out.innerHTML = "";
+    const sum = el("div", "badges");
+    sum.appendChild(badge("walklast", `🚶 ${station.name} で降りて徒歩`));
+    sum.appendChild(badge(addSecs <= 0 ? "time zero" : "time", `所要 ${durText(totalSecs)}（${addSecs <= 0 ? "短縮" : "+" + Math.round(addSecs / 60) + "分"}）`));
+
+    const ft = fareText(rideFare);
+    if (ft) sum.appendChild(badge("unknown", ft));
+
+    // 割引額 = 基準運賃 - 乗車運賃
+    const baseAmt = ctx.baseFareInfo && ctx.baseFareInfo.amount;
+    if (baseAmt != null && rideFare.amount != null) {
+      const disc = baseAmt - rideFare.amount;
+      if (disc > 0) sum.appendChild(badge("save", `割引 −${disc}円${ctx.baseFareInfo.complete && rideFare.complete ? "" : "（概算）"}`));
+      else if (disc === 0) sum.appendChild(badge("unknown", "割引なし（同額）"));
+    }
+    sum.appendChild(badge("walk", `徒歩 約${walkMin}分 / 約${walkMeters}m`));
+    out.appendChild(sum);
+
+    const route = el("div", "alight-route");
+    route.appendChild(renderLegs(ride));
+    route.appendChild(el("div", "alight-walkline", `🚶 ${station.name} → 目的地（徒歩 約${walkMin}分）`));
+    out.appendChild(route);
+  } catch (e) {
+    if (my !== currentToken()) return;
+    out.innerHTML = "";
+    out.appendChild(el("p", "alight-hint", "再検索に失敗しました: " + e.message));
+  }
 }
 
 function renderCandidates(detours) {
@@ -499,6 +859,23 @@ document.addEventListener("DOMContentLoaded", () => {
   const budgetOut = document.getElementById("budget-output");
   budget.addEventListener("input", () => (budgetOut.textContent = budget.value));
 
+  // ODPT キー入力 (localStorage に保存)
+  const odptInput = document.getElementById("odpt-key");
+  const odptStatus = document.getElementById("odpt-status");
+  if (odptInput) {
+    odptInput.value = getOdptKey();
+    const reflect = () => {
+      if (odptStatus) {
+        odptStatus.textContent = hasOdptKey() ? "✅ キー設定済み（運賃・通過駅の補完が有効）" : "";
+      }
+    };
+    reflect();
+    odptInput.addEventListener("change", () => {
+      setOdptKey(odptInput.value.trim());
+      reflect();
+    });
+  }
+
   document.getElementById("search-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const btn = document.getElementById("search-btn");
@@ -518,9 +895,10 @@ document.addEventListener("DOMContentLoaded", () => {
       const budgetMin = parseInt(budget.value, 10);
       const { baseCand, detours } = await findDetours(from, to, budgetMin);
       hideStatus();
-      renderBaseline(baseCand);
+      const ctx = { from, to, base: baseCand.journey, baseFareInfo: null };
       renderCandidates(detours);
       document.getElementById("results").hidden = false;
+      await renderBaseline(baseCand, ctx);
     } catch (e) {
       showStatus("検索に失敗しました: " + e.message, "error");
     } finally {
