@@ -171,8 +171,11 @@ button.primary:disabled { background: #9db5a8; opacity: 0.6; cursor: progress; }
   gap: 8px;
   align-items: center;
   font-size: 0.9rem;
-  padding: 3px 0;
+  padding: 3px 0 3px 10px;
+  border-left: 3px solid transparent;
 }
+.legs li.leg-transit { border-left-color: var(--brand); }
+.legs li.leg-walk { border-left: 3px dashed #cdd5dd; }
 .legs .dot {
   width: 10px; height: 10px; border-radius: 50%;
   flex: 0 0 auto; background: var(--unknown);
@@ -181,6 +184,54 @@ button.primary:disabled { background: #9db5a8; opacity: 0.6; cursor: progress; }
 .legs .leg-walk .dot { background: #b9c2cc; }
 .legs .leg-line { font-weight: 600; }
 .legs .leg-detail { color: var(--ink-soft); font-size: 0.82rem; }
+
+/* 設定 (ODPTキー) */
+.settings {
+  margin-top: 12px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 16px;
+  font-size: 0.9rem;
+}
+.settings summary { cursor: pointer; font-weight: 600; color: var(--ink); }
+.settings-body { margin-top: 10px; }
+.settings-body label { display: block; font-weight: 600; margin-bottom: 4px; font-size: 0.85rem; }
+.settings-body input {
+  width: 100%; box-sizing: border-box;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 0.9rem;
+}
+.settings-note { font-size: 0.78rem; color: var(--ink-soft); margin: 8px 0 2px; line-height: 1.5; }
+.settings-note a { color: var(--brand-dark); }
+.odpt-status { display: block; margin-top: 4px; color: var(--save); font-weight: 600; }
+
+/* インタラクティブ「降りて歩く」 */
+.alight-slot { margin-top: 12px; }
+.alight-hint, .alight-loading {
+  font-size: 0.82rem; color: var(--ink-soft); background: #f3f6f9;
+  border-radius: 8px; padding: 8px 10px; margin: 6px 0 0;
+}
+.alight-panel {
+  margin-top: 10px; padding: 12px; border: 1px dashed var(--line);
+  border-radius: 12px; background: #fafcff;
+}
+.alight-title { font-weight: 700; margin-bottom: 8px; }
+.alight-stations { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.alight-chip {
+  font-size: 0.72rem; padding: 2px 7px; border-radius: 999px;
+  background: #eef2f6; color: var(--ink-soft); border: 1px solid transparent;
+}
+.alight-chip.ride { background: #e3f4ea; color: var(--brand-dark); }
+.alight-chip.walk { background: #fff3e8; color: var(--extra); }
+.alight-chip.active { border-color: var(--brand); font-weight: 700; }
+.alight-range { width: 100%; accent-color: var(--brand); }
+.alight-result { margin-top: 8px; }
+.alight-note { font-size: 0.8rem; color: var(--ink-soft); margin: 4px 0 0; }
+.alight-route { margin-top: 6px; }
+.alight-walkline {
+  font-size: 0.85rem; color: var(--extra); font-weight: 600;
+  padding: 4px 0 0 10px; border-left: 3px dashed #f0c9a0;
+}
 
 .notes {
   margin-top: 28px;

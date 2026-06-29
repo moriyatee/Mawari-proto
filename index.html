@@ -38,6 +38,20 @@
       <button type="submit" id="search-btn" class="primary">回り道を探す</button>
     </form>
 
+    <details class="settings">
+      <summary>⚙️ 運賃・通過駅の設定（ODPTキー）</summary>
+      <div class="settings-body">
+        <label for="odpt-key">ODPT アクセストークン（Consumer Key）</label>
+        <input type="password" id="odpt-key" placeholder="ODPTキーを貼り付け（端末内に保存）" autocomplete="off" />
+        <p class="settings-note">
+          入力すると、運賃データの無い区間（東武・京成・私鉄等）の<strong>実額運賃</strong>と、
+          各乗車区間の<strong>通過駅</strong>を <a href="https://developer.odpt.org/" target="_blank" rel="noopener">ODPT</a>
+          から補完します。キーは<strong>この端末のブラウザ（localStorage）にのみ保存</strong>され、外部送信・リポジトリ保存はしません。
+          <span id="odpt-status" class="odpt-status"></span>
+        </p>
+      </div>
+    </details>
+
     <section id="status" class="status" hidden></section>
 
     <section id="results" class="results" hidden>
@@ -51,7 +65,9 @@
       <summary>このアプリについて / 既知の制約</summary>
       <ul>
         <li>経路データは無料の <a href="https://api.transit.ls8h.com/" target="_blank" rel="noopener">Transit API (ls8h)</a> をブラウザから直接利用しています（無認証・読み取り専用）。</li>
-        <li><strong>運賃はフィード依存</strong>です。東京メトロ・都営・路線バス等は運賃が出ますが、<strong>JR各線・新幹線・私鉄の一部は運賃データが無く「運賃不明」</strong>になります。経路に運賃不明の区間が1つでも含まれると、その経路全体の運賃が出ません。</li>
+        <li><strong>運賃はフィード依存</strong>です。東京メトロ・都営・路線バス等は運賃が出ますが、<strong>JR各線・新幹線・私鉄の一部は運賃データが無く「運賃不明」</strong>になります。経路に運賃不明の区間が1つでも含まれると、その経路全体の運賃が出ません。<strong>ODPTキーを設定すると</strong>、東武など私鉄/地下鉄の<strong>実額運賃</strong>と各乗車区間の<strong>通過駅</strong>を補完します（JR等は ODPT でも欠ける場合あり）。</li>
+        <li><strong>色分け</strong>：各乗車区間は路線色で表示します（API の路線色を使用）。</li>
+        <li><strong>通過駅スライダー</strong>（ODPTキー設定時）：経路が通過する駅を選ぶと、そこで降りて目的地まで歩く経路に再検索し、運賃と<strong>割引額</strong>を更新します。</li>
         <li><strong>歩行距離・歩数・カロリーは推定値</strong>です（徒歩時間 × 約80m/分 で換算）。</li>
         <li>回り道候補は、複数経路の列挙と「鉄道を避ける」検索を組み合わせて生成しています（PoC段階）。</li>
       </ul>
