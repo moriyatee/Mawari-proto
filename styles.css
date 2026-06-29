@@ -163,6 +163,7 @@ button.primary:disabled { background: #9db5a8; opacity: 0.6; cursor: progress; }
 .badge.add { background: #fdeaea; color: #c53030; }
 .badge.unknown { background: #edf0f2; color: var(--unknown); }
 .badge.walk { background: #eef4fb; color: #2c5282; }
+.badge.walklast { background: #e7f0ff; color: #2b4c91; border: 1px solid #c3d6f5; }
 
 .legs { list-style: none; margin: 6px 0 0; padding: 0; }
 .legs li {
